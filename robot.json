@@ -1,0 +1,19 @@
+{
+    "can-baud-rate": 1,
+    "robot-joints": [
+        {
+            "id": 403,
+            "pos_limit": 50.27,
+            "vel_limit": 50,
+            "torque_limit": 0.4,
+            "name": "Shoulder Motor"
+        },
+        {
+            "id": 370,
+            "pos_limit": 50.27,
+            "vel_limit": 40,
+            "torque_limit": 0.4,
+            "name": "Elbow Motor"
+        }
+    ]
+}

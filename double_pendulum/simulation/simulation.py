@@ -4,13 +4,13 @@ from matplotlib.animation import FuncAnimation
 import matplotlib.animation as mplanimation
 import time
 import math
+import wget
+import subprocess
+from pathlib import Path
 
 from double_pendulum.simulation.visualization import get_arrow, set_arrow_properties
-from cloud_pendulum_local import Client
-# from cloudpendulumclient.client import Client
 
 # from double_pendulum.python.double_pendulum.simulation.visualization import get_arrow, set_arrow_properties
-
 
 class Simulator:
     def __init__(self, plant):
@@ -394,60 +394,84 @@ class Simulator:
         self.x_des = np.asarray(x)
         self.desired_state = True
 
-    def activate_hardware(self):
-        """
-        Activate the pendulum hardware
-        """
-        import pyCandle
+    def CubicTimeScaling(self, Tf, t):
+        """Computes s(t) for a cubic time scaling
+        Source: Modern Robotics Toolbox (https://github.com/NxRLab/ModernRobotics/blob/master/packages/Python/modern_robotics/core.py#L1455C1-L1469C61)
+        :param Tf: Total time of the motion in seconds from rest to rest
+        :param t: The current time t satisfying 0 < t < Tf
+        :return: The path parameter s(t) corresponding to a third-order
+                 polynomial motion that begins and ends at zero velocity
 
-        # Create CANdle object and set FDCAN baudrate to 1Mbps
-        self.candle = pyCandle.Candle(pyCandle.CAN_BAUD_1M, True)
-        # Ping FDCAN bus in search of drives
-        ids = self.candle.ping()
-        # Add all found to the update list
-        for id in ids:
-            self.candle.addMd80(id)
+        Example Input:
+            Tf = 2
+            t = 0.6
+        Output:
+            0.216
+        """
+        return 3 * (1.0 * t / Tf) ** 2 - 2 * (1.0 * t / Tf) ** 3
 
-    def run_on_hardware(self, tf, dt, controller=None, actuated_joint=None):
-        import pyCandle
+    def JointTrajectory(self, thetastart, thetaend, Tf, N):
+        """Computes a straight-line trajectory in joint space
+        Source: Modern Robotics Toolbox (modified)
+        :param thetastart: The initial joint variables
+        :param thetaend: The final joint variables
+        :param Tf: Total time of the motion in seconds from rest to rest
+        :param N: The number of points N > 1 (Start and stop) in the discrete
+                  representation of the trajectory
+        :return: A trajectory as an N x n matrix, where each row is an n-vector
+                 of joint variables at an instant in time. The first row is
+                 thetastart and the Nth row is thetaend . The elapsed time
+                 between each row is Tf / (N - 1)
+
+        Example Input:
+            thetastart = np.array([1, 0, 0, 1, 1, 0.2, 0,1])
+            thetaend = np.array([1.2, 0.5, 0.6, 1.1, 2, 2, 0.9, 1])
+            Tf = 4
+            N = 6
+            method = 3
+        Output:
+            np.array([[     1,     0,      0,      1,     1,    0.2,      0, 1]
+                      [1.0208, 0.052, 0.0624, 1.0104, 1.104, 0.3872, 0.0936, 1]
+                      [1.0704, 0.176, 0.2112, 1.0352, 1.352, 0.8336, 0.3168, 1]
+                      [1.1296, 0.324, 0.3888, 1.0648, 1.648, 1.3664, 0.5832, 1]
+                      [1.1792, 0.448, 0.5376, 1.0896, 1.896, 1.8128, 0.8064, 1]
+                      [   1.2,   0.5,    0.6,    1.1,     2,      2,    0.9, 1]])
+        """
+        N = int(N)
+        timegap = Tf / (N - 1.0)
+        traj = np.zeros((len(thetastart), N))
+        for i in range(N):
+            s = self.CubicTimeScaling(Tf, timegap * i)
+            traj[:, i] = s * np.array(thetaend) + (1 - s) * np.array(thetastart)
+        traj = np.array(traj).T
+        return traj
+
+    def run_experiment(self, tf, dt, controller=None, experiment_type="DoublePendulum", user_token=None, x0=None, preparation_time=0.0, record=False):
+        if user_token is None:
+            from cloud_pendulum_local import Client
+            user_token = ""
+        else:
+            from cloudpendulumclient.client import Client
+
         import time
 
-        # Select pendulum from motor list
+        self.c = Client()
 
-        # Now we shall loop over all found drives to change control mode and enable them one by one
-        for md in self.candle.md80s:
-            self.candle.controlMd80SetEncoderZero(
-                md
-            )  #  Reset encoder at current position
-            self.candle.controlMd80Mode(
-                md, pyCandle.IMPEDANCE
-            )  # Set mode to impedance control
-            self.candle.controlMd80Enable(md, True)  # Enable the drive
-
-        # Begin update loop (it starts in the background)
-
-        self.candle.begin()
-        candle_dict = {}
-
-        motornum = 0
-
-        for motor in self.candle.md80s:
-            candle_dict[self.candle.md80s[motornum].getId()] = motornum
-            motornum += 1
-
-        shoulder_motor_id = 171
-        elbow_motor_id = 172
-
-        shoulder_motor = candle_dict[shoulder_motor_id]
-        elbow_motor = candle_dict[elbow_motor_id]
-
-        # set zero impedance (kp=kd=0) for pure torque control
-        self.candle.md80s[shoulder_motor].setImpedanceControllerParams(0, 0)
-        self.candle.md80s[elbow_motor].setImpedanceControllerParams(0, 0)
-
-        input(
-            "Press bring the pendulum to the starting configuration and press enter to continue..."
+        initial_state = x0.copy()
+        if initial_state is not None:
+            initial_state = initial_state[0:len(initial_state)//2]
+        session_token, self.live_url = self.c.start_experiment(
+            user_token, experiment_type, tf, preparation_time = preparation_time, record=record, initial_state=initial_state
         )
+        print("Your session token is:", session_token)
+
+        self.vod_filepath = None
+        
+        # # set zero impedance (kp=kd=0) for pure torque control
+        kp=0.0
+        kd=0.0
+        self.c.set_impedance_controller_params(kp, kd, session_token)
+
         n = int(tf / dt)
 
         meas_time_vec = np.zeros(n)
@@ -466,200 +490,19 @@ class Simulator:
         i = 0
         meas_dt = 0.0
         meas_time = 0.0
+        max_exec_freq=0.0
+        min_exec_freq=math.inf
+        avg_exec_freq=0.0
         print("Control Loop Started!")
-        safety_position_limit = 4.0 * np.pi  # example limits, replace with your values
-        safety_velocity_limit = 50
-        tau_prev = np.zeros(2)
-        alpha = 0.05
-
-        # Auto update loop is running in the background updating data in candle.md80s vector. Each md80 object can be
-        # Called for data at any time
-        while i < n:
-            start_loop = time.time()
-            meas_time += meas_dt
-
-            ## Do your stuff here - START
-            measured_position_shoulder = self.candle.md80s[shoulder_motor].getPosition()
-            measured_velocity_shoulder = self.candle.md80s[shoulder_motor].getVelocity()
-            measured_torque_shoulder = self.candle.md80s[shoulder_motor].getTorque()
-            measured_position_elbow = self.candle.md80s[elbow_motor].getPosition()
-            measured_velocity_elbow = self.candle.md80s[elbow_motor].getVelocity()
-            measured_torque_elbow = self.candle.md80s[elbow_motor].getTorque()
-
-            # Check safety conditions
-            if (
-                abs(measured_position_shoulder) > safety_position_limit
-                or abs(measured_position_elbow) > safety_position_limit
-                or abs(measured_velocity_shoulder) > safety_velocity_limit
-                or abs(measured_velocity_elbow) > safety_velocity_limit
-            ):
-                print("Safety conditions violated! Slowing down motors for 1 second.")
-                # Slow down motors with kd=1 for 1 second at current rate dt
-                steps = int(1 / dt)
-                for _ in range(steps):
-                    # send impedance command with kd=1 (derivative gain) to slow down motors
-                    self.candle.md80s[shoulder_motor].setImpedanceControllerParams(
-                        0, 0.1
-                    )
-                    self.candle.md80s[elbow_motor].setImpedanceControllerParams(0, 0.1)
-
-                    # Zero torque to let the impedance damping slow the motor
-                    self.candle.md80s[shoulder_motor].setTargetTorque(0)
-                    self.candle.md80s[elbow_motor].setTargetTorque(0)
-
-                    time.sleep(dt)
-
-                print(
-                    f"The limit violating state was ({measured_position_shoulder}, {measured_position_elbow}, {measured_velocity_shoulder}, {measured_velocity_elbow})"
-                )
-                break
-
-            self.x = np.array(
-                [
-                    measured_position_shoulder,
-                    measured_position_elbow,
-                    measured_velocity_shoulder,
-                    measured_velocity_elbow,
-                ]
-            )
-            if i == 0:
-                print("Initial state x:", self.x)
-
-            # Control logic
-            if controller is not None:
-                # tau = controller.get_control_output(x=self.x, t=self.t)
-                tau = controller.get_control_output(x=self.x, t=meas_time)
-
-                # Apply smoothing to reduce torque jumps
-                # tau = alpha * tau_desired + (1 - alpha) * tau_prev
-                # tau_prev = tau.copy()
-
-                if actuated_joint == "elbow":
-                    self.candle.md80s[shoulder_motor].setTargetTorque(0.0)
-                    self.candle.md80s[elbow_motor].setTargetTorque(tau[1])
-                    tau[0] = 0.0
-                elif actuated_joint == "shoulder":
-                    # if i in range(5):
-                    #     self.candle.md80s[shoulder_motor].setTargetTorque(-tau[0])
-                    #     self.candle.md80s[elbow_motor].setTargetTorque(0.0)
-                    #     tau[1] = 0.0
-                    # else:
-                    self.candle.md80s[shoulder_motor].setTargetTorque(tau[0])
-                    self.candle.md80s[elbow_motor].setTargetTorque(0.0)
-                    tau[1] = 0.0
-                else:
-                    self.candle.md80s[shoulder_motor].setTargetTorque(tau[0])
-                    self.candle.md80s[elbow_motor].setTargetTorque(tau[1])
-            else:
-                tau[0] = 0
-                tau[1] = 0
-
-            # Collect data for plotting
-            meas_time_vec[i] = meas_time
-            meas_pos_shoulder[i] = measured_position_shoulder
-            meas_vel_shoulder[i] = measured_velocity_shoulder
-            meas_tau_shoulder[i] = measured_torque_shoulder
-            des_tau_shoulder[i] = tau[0]
-            meas_pos_elbow[i] = measured_position_elbow
-            meas_vel_elbow[i] = measured_velocity_elbow
-            meas_tau_elbow[i] = measured_torque_elbow
-            des_tau_elbow[i] = tau[1]
-            # print("Des elbow: ",tau[1])
-
-            ## Do your stuff here - END
-            i += 1
-            exec_time = time.time() - start_loop
-            # if exec_time > dt:
-            #     print("Control loop is too slow!")
-            #     print("Control frequency:", 1 / exec_time, "Hz")
-            #     print("Desired frequency:", 1 / dt, "Hz")
-            #     print()
-
-            while time.time() - start_loop < dt:
-                pass
-            meas_dt = time.time() - start_loop
-            # i += 1
-        print("Control Loop Ended!")
-
-        # Send a few zeros to the motor and then close the update loop
-        for i in range(5):
-            self.candle.md80s[shoulder_motor].setTargetTorque(0.0)
-            self.candle.md80s[elbow_motor].setTargetTorque(0.0)
-        self.candle.end()
-
-        self.t_values = meas_time_vec
-        self.x_values = np.vstack(
-            (meas_pos_shoulder, meas_pos_elbow, meas_vel_shoulder, meas_vel_elbow)
-        ).T
-        self.tau_values = np.vstack((meas_tau_shoulder, meas_tau_elbow)).T
-        self.des_tau_values = np.vstack((des_tau_shoulder, des_tau_elbow)).T
-
-        return self.t_values, self.x_values, self.tau_values, self.des_tau_values
-    
-    def run_experiment(self, tf, dt, controller=None, experiment_type=None, actuated_joint=None, motors = None):
-        client=Client(motors = motors)
-        if motors is None:
-            client.start_experiment()
-        else:
-            client.start_experiment(motors)
-        session_token, _ = client.start_experiment("hello", experiment_type, tf+2, False)
-        # # set zero impedance (kp=kd=0) for pure torque control
-        kp=0.0
-        kd=0.0
-        client.set_impedance_controller_params([kp, kp], [kd, kd], session_token)
-        input(
-            "Press bring the pendulum to the starting configuration and press enter to continue..."
-        )
-        n = int(tf / dt)+1
-
-        meas_time_vec = np.zeros(n)
-        meas_pos_shoulder = np.zeros(n)
-        meas_vel_shoulder = np.zeros(n)
-        meas_tau_shoulder = np.zeros(n)
-        des_tau_shoulder = np.zeros(n)
-        meas_pos_elbow = np.zeros(n)
-        meas_vel_elbow = np.zeros(n)
-        meas_tau_elbow = np.zeros(n)
-        des_tau_elbow = np.zeros(n)
-
-        tau = [0.0, 0.0]
-
-        # defining runtime variables
-        i = 0
-        meas_dt = 0.0
-        meas_time = 0.0
-        max_freq=0.0
-        min_freq=math.inf
-        avg_freq=0.0
-        print("Control Loop Started!")
-        safety_position_limit = 10.0 * np.pi  # example limits, replace with your values
-        safety_velocity_limit = 50
         # Auto update loop is running in the background updating data in candle.md80s vector. Each md80 object can be
         # Called for data at any time
         while meas_time < tf:
             start_loop = time.time()
             # meas_time += meas_dt      
-            measured_position=client.get_position(session_token)
-            measured_velocity=client.get_velocity(session_token)
-            measured_torque=client.get_torque(session_token)
+            measured_position=self.c.get_position(session_token)
+            measured_velocity=self.c.get_velocity(session_token)
+            measured_torque=self.c.get_torque(session_token)
             # print("TEST")
-
-            # Check safety conditions for both joints
-            if (
-                np.any(np.abs(measured_position) > safety_position_limit) or
-                np.any(np.abs(measured_velocity) > safety_velocity_limit)
-            ):
-                print("Safety conditions violated! Slowing down motors for 1 second.")
-                
-                # Apply damping only for 1 second at current dt
-                steps = int(1 / dt)
-                for _ in range(steps):
-                    client.set_impedance_controller_params([0.0, 0.0], [0.1, 0.1], session_token)
-                    client.set_torque(np.array([0.0, 0.0]), session_token)
-                    time.sleep(dt)
-
-                print(f"The limit-violating state was: position = {measured_position}, velocity = {measured_velocity}")
-                break
             
             self.x = np.concatenate([measured_position, measured_velocity])
 
@@ -670,17 +513,10 @@ class Simulator:
             if controller is not None:
                 tau = controller.get_control_output(x=self.x, t=meas_time)
                 tau=list(tau)
-                if actuated_joint == "elbow":
-                    client.set_torque([0.0, tau[1]], session_token)
-                    tau[0] = 0.0
-                elif actuated_joint == "shoulder":
-                    client.set_torque([tau[0], 0.0], session_token)
-                    tau[1] = 0.0
-                else:
-                    client.set_torque(tau, session_token)
+                self.c.set_torque(tau, session_token)
             else:
                 tau = [0.0, 0.0]
-                client.set_torque(tau, session_token)
+                self.c.set_torque(tau, session_token)
 
             # Collect data for plotting
             meas_time_vec[i] = meas_time
@@ -696,9 +532,9 @@ class Simulator:
             ## Do your stuff here - END
             i += 1
             exec_time = time.time() - start_loop
-            min_freq = min(min_freq, 1.0 / exec_time)
-            max_freq = max(max_freq, 1.0 / exec_time)
-            avg_freq = avg_freq + 1.0 / exec_time
+            min_exec_freq = min(min_exec_freq, 1.0 / exec_time)
+            max_exec_freq = max(max_exec_freq, 1.0 / exec_time)
+            avg_exec_freq = avg_exec_freq + 1.0 / exec_time
             # if exec_time > dt:
             #     print("Control loop is too slow!")
             #     print("Control frequency:", 1 / exec_time, "Hz")
@@ -711,19 +547,21 @@ class Simulator:
             meas_time += meas_dt   
             # i += 1
         print("Control Loop Ended!")
-        avg_freq = avg_freq / float(i)
+        avg_exec_freq = avg_exec_freq / float(i)
         print(
             "Finished",
-            "- avg frequency:", avg_freq,
-            " - min frequency:", min_freq,
-            " - max frequency:", max_freq
+            "- avg exec frequency:", avg_exec_freq,
+            " - min exec frequency:", min_exec_freq,
+            " - max exec frequency:", max_exec_freq
         )
 
-        # # Send a few zeros to the motor and then close the update loop
-        # for i in range(5):
-        #     client.set_torque([0.0, 0.0], session_token)
-        client.stop_experiment(session_token)
+        download_url = self.c.stop_experiment(session_token)
 
+        if record==True:
+            filename = wget.download(download_url,".")
+            self.vod_filepath = f'{Path(filename).stem}.mp4'
+            self.convert_flv_to_mp4(f'{filename}', self.vod_filepath)
+        
         # Stack and return data
         self.t_values = meas_time_vec
         self.x_values = np.vstack(
@@ -732,4 +570,24 @@ class Simulator:
         self.tau_values = np.vstack((meas_tau_shoulder, meas_tau_elbow)).T
         self.des_tau_values = np.vstack((des_tau_shoulder, des_tau_elbow)).T
 
-        return self.t_values, self.x_values, self.tau_values, self.des_tau_values
+        return self.t_values, self.x_values, self.tau_values, self.des_tau_values, self.vod_filepath
+
+    def convert_flv_to_mp4(self, input_path, output_path):
+        """
+        Convert an FLV file to MP4 using FFmpeg.
+    
+        :param input_path: Path to the input FLV file.
+        :param output_path: Path to the output MP4 file.
+        """
+        command = [
+            "ffmpeg",
+            "-i", input_path,    # Input file
+            "-c:v", "copy",      # Copy video stream
+            "-c:a", "copy",      # Copy audio stream
+            output_path          # Output file
+        ]
+        process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if process.returncode == 0:
+            print(f"Conversion successful: {output_path}")
+        else:
+            print(f"Error during conversion: {process.stderr.decode()}")
